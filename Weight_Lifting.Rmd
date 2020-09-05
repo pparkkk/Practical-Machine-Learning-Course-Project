@@ -1,0 +1,242 @@
+---
+title: 'Practical Machine Learning: Weight Lifting Exercise'
+author: "Park"
+date: "9/5/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Executive Summary
+This is the *Practical Machine Learning* course project of the third class in the *Statistics and Machine Learning* Specialization, taught in Coursera.
+
+This analysis uses various measurements from accelerometers on the belt, forearm, arm, and dumbbell of 6 participants. Then using a machine learning algorithms to predict which class of activity they were performing. There are 5 possible classes (A-E), of which only A means the participants exercised correctly. The remaining classes represent different types of weight lifting exercise, but all were done wrongly.
+
+There are 3 different algorithms in use to decide which performs the most accurately, namely classification trees, random forests and boosting. From this, the random forests method is, by far, the most accurate model with **2.51** out-of-sample error rate.
+  
+## Raw Data and Preprocess
+
+### Download Raw Data
+
+There are 2 raw data files that needed to be downloaded into R. First, the training set which will be used to **build** the model. Second, the validating set which will be used to **validate** the model (answer the quiz). Note that both files are in the *.csv* format.
+
+``` {r loaddata, echo = TRUE}
+#download the file
+if (!file.exists("./training.csv")) {
+download.file(url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", destfile = "./training.csv")
+}
+if (!file.exists("./validating.csv")) {
+download.file(url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", destfile = "./validating.csv")
+}
+
+#read into R
+training <- read.csv("training.csv")
+validating <- read.csv("validating.csv")
+```
+
+Although the *validating* set should not be looked until the model is finalized and the prediction is asked for, the data set must undergo the same transformations or pre-processes as the *training* set.
+  
+### Preprocess Raw Data
+``` {r colnames, echo = TRUE}
+names(training)
+```
+
+The above output lists all of the variable names recorded in the data set. Since this analysis only interests in the *belt, forearm, arm and dumbbell* parts to predict the *classe* variable, others should be discarded as irrelevant. Thus, select only the columns with these names from **both** data sets.
+
+```{r selectcol, echo = TRUE}
+column <- grep(pattern = ".belt.*|.arm.*|.dumbbell.*|classe", x = names(training))
+training <- subset(training, select = column)
+validating <- subset(validating, select = column)
+```
+
+Let's preview the data.
+
+``` {r previewdata, echo = TRUE}
+training[23:25,]
+```
+
+From above, it is obvious that there are many columns with missing data, which comes in different forms: *NA, empty space or #DIV/0!*. Any observations consisting of one of these forms of missing data will not be useful for the prediction. So, let's loop through all of the columns in the *training* set and subset those with missing data out. Again, do the same with the *validating* set.
+
+``` {r subsetdata, echo = TRUE}
+#identify columns with missing data
+miss <- c(); none <- c(); nan <- c()
+for (i in 1:ncol(training)) {
+    col <- training[,i]
+    missing <- sum(is.na(col))  #detecting NAs
+    gotinfo <- grep(pattern = ".+", x = col)    #detecting missing data
+    inf <- grep(pattern = "#DIV/0!", x = col)   #detecting division by 0
+    if (missing > 0) {miss <- c(miss, i)}
+    if (length(gotinfo) != length(col)) {none <- c(none, i)}
+    if (length(inf) != 0) {nan <- c(nan,i)}
+}
+
+#subset those out
+remove <- sort(unique(c(miss, none, nan)))
+training <- subset(training, select = -remove)
+validating <- subset(validating, select = -remove)
+```
+
+Let's look at the brief structure of the data set after removing unnecessary columns out.
+``` {r datastructure, echo = TRUE}
+training$classe <- as.factor(training$classe)   #coerce classe to a factor variable
+str(training)
+```
+
+Note that for some variables, the first 10 values are almost or even identical. A predictor is no longer useful if there is no variation in its measurement values. So, let's check if there is a variable for which the variance is *near zero*.
+
+``` {r nzv, echo = TRUE}
+library(caret)
+nearzero <- nearZeroVar(training[,-53], saveMetrics = TRUE) #discard the outcome
+identical((nearzero$nzv == FALSE), rep(TRUE, nrow(nearzero)))
+```
+
+The *TRUE* outcome says that there is no variable with near zero variance.
+
+In building and selecting the model, it should be *tested* to see whether it is performing and decide which of them performs the best. Since, the *validating* set should not be touched, another data set must be built to serve this purpose. Hence, the following splits the *training* data set into 2 subsets: *train* and *test* with 3 to 1 ratio.
+
+``` {r splitdata, echo = TRUE}
+set.seed(801)   #for reproducibility
+inTrain <- createDataPartition(y = training$classe, p = 0.75, list = FALSE)
+train <- training[inTrain, ] ; test <- training[-inTrain, ]
+```
+  
+## Exploratory Data Analysis  
+
+Linear correlation coefficient (PMCC) can play an important role in prediction. First, let's calculate the correlation coefficient between *classe* (outcome) and all the remaining variables (predictors).
+
+``` {r calcor, echo = TRUE}
+corr <- data.frame(variable = names(train), PMCC = rep(NA, ncol(train)))
+for (i in 1:ncol(train) - 1) {
+    corr[i,2] <- cor(train[,i], as.numeric(train$classe))
+}
+corr[which.max(abs(corr$PMCC)),]
+```
+
+The maximum correlation coefficient is only 0.34 (2dp) which is clearly a *weak* linear relationship. This suggests that any form of linear model is not suitable for this data set.
+
+As per the structure of the data set, it contains 53 variables. If were to use all of them to predict the *classe* outcome, it would be highly computationally demanding and time-consuming. It would be much faster if some of the variables are combined into one.
+
+Without losing useful information, a variable should be combined with those very similar to them. Highly correlated variables usually measure similar or the same thing, but maybe in the same (positive PMCC) or opposite (negative PMCC) direction. So, let's cross-calculate the correlation coefficient and see how many of them are highly correlated.
+
+``` {r highcor, echo = TRUE}
+corrall <- abs(cor(train[,-53])); diag(corrall) <- 0
+highcor <- which(corrall > 0.9, arr.ind = TRUE)   
+length(highcor)/2   #number of pairs with correlation higher than 0.9
+```
+
+Even with 0.9 (a very strong relationship), there are 22 pairs of variables with a correlation coefficient higher than the threshold. Not to mention 0.75 and 0.8, the number will explode. 
+
+To compress the number of predictors without losing vital information, the principal component analysis (PCA) is used. First, apply the PCA for all columns except the outcome and plot the proportion of variance explained by each component.
+
+``` {r varex, echo = TRUE}
+pca <- prcomp(train[,-53])
+varex <- pca$sdev^2/sum(pca$sdev^2)
+comp <- length(which(varex >= 0.001))
+plot(1:52, varex, col = "midnightblue", pch = 16, xlab = "Index", 
+     ylab = "Percentage of Variance Explained", 
+     main = "Proportion of Variance Explained by Each Measurement")
+abline(h = 0.001, col = "orange", lwd = 2)
+```
+
+The threshold for useful components will be those which explain at least 0.1% of the total variance in the data set. Next, let's *preprocess* the *train*, *test* and *validating* sets using PCA. Note that only 'useful' components will be stored in the new data frames.
+
+``` {r preprocess, echo = TRUE}
+prep <- preProcess(train[,-53], method = "pca", pcaComp = comp)
+trainpca <- predict(prep, train[,-53]); testpca <- predict(prep, test[,-53])
+validatingpca <- predict(prep, validating[,-53])
+
+# add the outcome variable into the data frames
+trainpca$classe <- train$classe; testpca$classe <- test$classe
+validatingpca$classe <- validating$classe
+```
+  
+## Model Building and Selection
+
+There are 3 models in consideration in this analysis. They are classification trees, random forests and boosting. This is because classification trees can be accurate in non-linear settings whereas random forests and boosting are the 2 most accurate algorithms.
+  
+### Cross-Validation
+In each of the model, there is a use of **k-fold cross-validation**. It will split the *train* data set into 5 equal folds. Of this, one is left as the testing set and the remaining 4 is used to fit the model. The process repeats such that every fold gets to be the testing set. Then, the results are averaged. Before getting to the model, let's set up this setting first.
+
+``` {r cv, echo = TRUE}
+cvsettings <- trainControl(method = "cv", number = 5, verboseIter = FALSE)
+```
+  
+### Classification Trees 
+The first model in concern is the classification trees. This refers to the method *rpart* in the *train* function (caret package). After fitting the model, the dendrogram will visualize the result.
+
+``` {r tree, echo = TRUE, cache = TRUE}
+fittree <- train(classe ~ ., data = trainpca, method = "rpart", trControl = cvsettings)
+library(rattle); fancyRpartPlot(fittree$finalModel)
+```
+
+The algorithm classifies the data into 3 outcome groups: *A,D and E but none to B and C*. This is a sign that may be the algorithm may not work well in this situation. To quantify this, let's apply the model to the *test* set and evaluate the accuracy.
+
+``` {r acctree, echo = TRUE}
+predtree <- predict(fittree, newdata = testpca)
+confusionMatrix(predtree, testpca$classe)
+```
+
+In the *Overall Statistics* section, the model is only **38.36%** accurate. This is very low and suggests that the model is performing poorly.
+  
+### Random Forests
+
+Let's turn to the random forests method. The algorithm still uses the k-fold cross-validation to reduce the bias and variance in the prediction, even though it takes time to compute.
+
+``` {r rf, echo = TRUE, cache = TRUE}
+fitrf <- train(classe ~ ., data = trainpca, method = "rf", trControl = cvsettings)
+fitrf$finalModel
+```
+
+The *finalModel* section demonstrates that the algorithm uses 500 trees to fit the model. A large number of trees used may be an indicator that the method perform such accurately (estimate of error rate = 2.29%). However, let's see this in the *test* set.
+
+``` {r accrf, echo = TRUE}
+predrf <- predict(fitrf, newdata = testpca)
+confusionMatrix(predrf, testpca$classe)
+```
+
+From above, the algorithm is proved to be **97.49%** accurate on the *test* set. This is much more accurate than the classification trees. 
+
+### Boosting
+
+This is the final model that will be taken into consideration for this analysis. Just as before, the same cross-validation settings is used to build the model. Then, apply to the *test* set to evaluate the accuracy.
+
+``` {r boosting, echo = TRUE, cache = TRUE}
+fitgbm <- train(classe ~ ., data = trainpca, method = "gbm", trControl = cvsettings, verbose = FALSE)
+fitgbm$finalModel
+```
+
+The algorithm uses 150 iterations and found that all of the predictors had some influence on the prediction. Not only that it reinforces the fact that all of the PCA components selected are useful, so many iterations may imply that it is accurate (to some extent).
+
+``` {r accboosting, echo = TRUE}
+predgbm <- predict(fitgbm, newdata = testpca)
+confusionMatrix(predgbm, testpca$classe)
+```
+
+Surprisingly, the output says that the accuracy of the model is only **81.34%**. Although it is much higher than the classification tree, it is not as high as the random forest.
+  
+### Model Selection
+It is obvious that the *random forests* algorithm should be used as the final model and applied to the *validating* set. There is no need to fit another model with all the previous predictions as the predictors. This is because the *fitrf* model is accurate enough. Combining the predictors will only take more time but yield nearly accurate results as the *fitrf* model.
+  
+## Conclusion
+
+The *random forest* algorithm will be used to predict on the *validating set*. Since all of the pre-processes were done prior this, only the model is left to apply.
+
+``` {pred, echo = TRUE}
+predict(fitrf, newdata = validatingpca)
+```
+
+To get an estimate out-of-sample error rate, it is equal to 1 minus the accuracy of the prediction. Since the *validating* set has only 20 observations, it is highly possible that the accuracy will be 100% purely by chance. Hence, 0% out-of-sample error. This suggests that it is not a good representative. 
+
+Alternatively, the *test* set will give a much more representative figure as it has a lot more sample size. In addition, the model is not refined after applying to the *test* set. So, the *test* set is not actually counted as part of the data set used to build the model.
+
+``` {r outerr, echo = TRUE}
+#how many observations in the test and validating sets
+cbind(dim(test)[1], dim(validating)[1]) 
+
+1 - confusionMatrix(predrf, testpca$classe)$overall['Accuracy']
+```
+
+The out-of-sample error rate is estimated to be **2.51%** (2dp).
+
